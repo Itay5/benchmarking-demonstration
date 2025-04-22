@@ -1,0 +1,31 @@
+# PKB config TEMPLATE for custom 'wrk' benchmark
+
+wrk: # Use the BENCHMARK_NAME from wrk_benchmark.py
+  vm_groups:
+    default:
+      os_type: ubuntu2004 # Specify client OS consistent with benchmark code needs
+      vm_spec:
+        GCP: 
+          machine_type: e2-standard-2
+          zone: us-central1-b
+      disk_spec:
+        GCP: 
+          disk_type: pd-standard
+          disk_size: 50
+
+  # --- Flags specific to the custom wrk benchmark ---
+  flags:
+    wrk_target_url: "http://__TARGET_IP__/upload" # PLACEHOLDER
+
+    # Note: Paths are relative to the *PKB root directory* on the runner
+    # because the benchmark code (PushFile) will resolve them from there.
+    wrk_script_local_path: "scripts/upload_script.lua"
+    wrk_script_remote_path: "upload_script.lua" # Name on the remote VM
+    wrk_script_data_files:
+      - "sample.jpg" # Path relative to PKB root on runner
+
+    # Load profile parameters
+    wrk_num_threads: 8
+    wrk_num_conns: 64
+    wrk_duration: 120
+    # wrk_flags: "--timeout 10s" # Example additional flags for wrk binary 

@@ -1,0 +1,321 @@
+name: GCP Cloud Run Demo Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      memory_mb:
+        description: 'Cloud Run Memory (MB)'
+        required: true
+        default: '512'
+        type: choice
+        options: ['512', '1024', '2048']
+      concurrency:
+        description: 'Cloud Run Concurrency Limit'
+        required: true
+        default: '80'
+        type: number
+      cpu_cores:
+        description: 'Cloud Run CPU Cores (1, 2, 4)'
+        required: true
+        default: '1'
+        type: choice
+        options: ['1', '2', '4']
+      min_instances:
+        description: 'Cloud Run Min Instances (0 for cold starts)'
+        required: true
+        default: '0'
+        type: number
+      max_instances:
+        description: 'Cloud Run Max Instances (Autoscaling Limit)'
+        required: true
+        default: '10'
+        type: number
+      image_tag:
+        description: 'Docker Image Tag (e.g., latest or git sha)'
+        required: true
+        default: 'latest'
+        type: string
+
+jobs:
+  benchmark-run:
+    runs-on: ubuntu-latest
+    # Define permissions for GCP authentication action if needed
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      # GCP Credentials & Project
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      # Use Workload Identity Federation (Recommended) or Service Account Key
+      # WIF Example:
+      # GCP_WORKLOAD_IDENTITY_PROVIDER: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/<YOUR_POOL_ID>/providers/<YOUR_PROVIDER_ID>"
+      # GCP_SERVICE_ACCOUNT: "<YOUR_SERVICE_ACCOUNT_EMAIL>"
+      # SA Key Example (Less Secure):
+      GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY }} # Assumes SA Key is stored as JSON string
+
+      # Infracost API Key
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+      # Application Image URI (adjust repo name as needed)
+      IMAGE_URI: "us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/demo-repo/demo-api:${{ github.event.inputs.image_tag }}"
+
+      # Terraform Variables from Inputs
+      TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+      TF_VAR_region: "us-central1" # Or make this an input
+      TF_VAR_image_uri: "us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/demo-repo/demo-api:${{ github.event.inputs.image_tag }}"
+      TF_VAR_memory_mb: ${{ github.event.inputs.memory_mb }}
+      TF_VAR_cpu_cores: ${{ github.event.inputs.cpu_cores }}
+      TF_VAR_concurrency_limit: ${{ github.event.inputs.concurrency }}
+      TF_VAR_min_instances: ${{ github.event.inputs.min_instances }}
+      TF_VAR_max_instances: ${{ github.event.inputs.max_instances }}
+
+      # Unique Run ID for tagging and isolation
+      RUN_ID: "run-${{ github.run_id }}-${{ github.event.inputs.memory_mb }}mb-${{ github.event.inputs.concurrency }}con"
+
+      # Path for PKB checkout
+      PKB_DIR: ${{ github.workspace }}/PerfKitBenchmarker
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: 'google-github-actions/auth@v2'
+        with:
+          # Use WIF (preferred)
+          #workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }} # Set this env var or paste value
+          #service_account: ${{ env.GCP_SERVICE_ACCOUNT }}           # Set this env var or paste value
+          # Or Use SA Key (less secure)
+          credentials_json: ${{ env.GCP_SA_KEY_JSON }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0" # Specify desired version
+
+      - name: Remove Terraform Lock File (Force Provider Upgrade)
+        working-directory: infra
+        run: rm -f .terraform.lock.hcl
+
+      - name: Terraform Init (Infra)
+        working-directory: infra
+        run: terraform init -upgrade
+
+      - name: Terraform Apply (Infra)
+        id: apply
+        working-directory: infra
+        run: |
+          # Using TF_VAR_... env vars for variables
+          terraform apply -auto-approve -var="run_id=${{ env.RUN_ID }}"
+          echo "lb_ip=$(terraform output -raw load_balancer_ip)" >> $GITHUB_OUTPUT
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+
+      - name: Run Infracost Estimate
+        id: infracost
+        working-directory: infra
+        run: |
+          # Generate a tfvars file on the fly for infracost to ensure vars are picked up
+          cat <<EOF > infracost.tfvars.json
+          {
+            "project_id": "${{ env.TF_VAR_project_id }}",
+            "region": "${{ env.TF_VAR_region }}",
+            "image_uri": "${{ env.TF_VAR_image_uri }}",
+            "memory_mb": ${{ env.TF_VAR_memory_mb }},
+            "cpu_cores": ${{ env.TF_VAR_cpu_cores }},
+            "concurrency_limit": ${{ env.TF_VAR_concurrency_limit }},
+            "min_instances": ${{ env.TF_VAR_min_instances }},
+            "max_instances": ${{ env.TF_VAR_max_instances }},
+            "run_id": "${{ env.RUN_ID }}"
+          }
+          EOF
+
+          infracost breakdown --path . \
+            --format json \
+            --show-skipped \
+            --terraform-var-file=infracost.tfvars.json \
+            --out-file ../infracost_estimate.json # Save output one level up
+          echo "Saved Infracost estimate to infracost_estimate.json"
+
+      - name: Upload Infracost Estimate Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-estimate-${{ env.RUN_ID }}
+          path: infracost_estimate.json
+
+      - name: Clone PerfKitBenchmarker
+        run: git clone --depth 1 https://github.com/GoogleCloudPlatform/PerfKitBenchmarker.git ${{ env.PKB_DIR }}
+
+      - name: Install PKB Dependencies
+        working-directory: ${{ env.PKB_DIR }}
+        run: |
+          grep -v '^--require-hashes' requirements.txt > requirements_nohash.txt
+          pip install -r requirements_nohash.txt
+
+      - name: Install Custom PKB Benchmark Module
+        run: |
+          echo "Copying custom wrk benchmark module..."
+          # Create target directory within PKB clone
+          mkdir -p ${{ env.PKB_DIR }}/perfkitbenchmarker/linux_benchmarks
+          # Copy your custom benchmark file into PKB
+          cp ${{ github.workspace }}/pkb_extensions/linux_benchmarks/wrk_benchmark.py ${{ env.PKB_DIR }}/perfkitbenchmarker/linux_benchmarks/
+
+      - name: Prepare PKB Run Files and Generate Config
+        run: |
+          echo "Copying benchmark scripts and data *to PKB root*..."
+          # Copy needed files relative to the PKB root where benchmark code expects them
+          mkdir -p ${{ env.PKB_DIR }}/scripts
+          cp ${{ github.workspace }}/scripts/upload_script.lua ${{ env.PKB_DIR }}/scripts/
+          cp ${{ github.workspace }}/sample.jpg ${{ env.PKB_DIR }}/
+
+          echo "Generating final PKB config file with target IP..."
+          TARGET_IP=${{ steps.apply.outputs.lb_ip }}
+          CONFIG_TEMPLATE="${{ github.workspace }}/pkb/configs/cloudrun_image_saver_wrk.yaml.template"
+          FINAL_CONFIG_PATH="${{ github.workspace }}/final_pkb_config.yaml"
+          sed "s|__TARGET_IP__|${TARGET_IP}|g" "${CONFIG_TEMPLATE}" > "${FINAL_CONFIG_PATH}"
+          echo "Final PKB config generated at: ${FINAL_CONFIG_PATH}"
+          cat "${FINAL_CONFIG_PATH}"
+
+      - name: Run PerfKitBenchmarker
+        id: pkb
+        working-directory: ${{ env.PKB_DIR }}
+        run: |
+          echo "Running PKB..."
+          CONFIG_FILE_PATH="${{ github.workspace }}/final_pkb_config.yaml"
+          # Create a PKB-compliant run_uri (must be short, alphanumeric - adjust if needed)
+          # Using run_id + attempt should be reasonably unique and deterministic between steps
+          PKB_RUN_URI="r$(echo ${{ github.run_id }}${{ github.run_attempt }} | sed 's/[^a-zA-Z0-9]//g' | tail -c 10)"
+          echo "Using PKB run URI: $PKB_RUN_URI"
+          # Pass the generated URI to the next step for retrieval
+          echo "pkb_run_uri=${PKB_RUN_URI}" >> $GITHUB_OUTPUT
+
+          python3 pkb.py --cloud=GCP \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --benchmarks=wrk \
+            --benchmark_config_file=${CONFIG_FILE_PATH} \
+            --run_uri="$PKB_RUN_URI" \
+            --accept_licenses=true
+          echo "PKB run command executed."
+
+      - name: Retrieve PKB JSON Results
+        id: retrieve_results
+        run: |
+          # Use the run_uri output from the previous step
+          PKB_RUN_URI="${{ steps.pkb.outputs.pkb_run_uri }}"
+          if [ -z "$PKB_RUN_URI" ]; then
+            echo "Error: Could not get PKB_RUN_URI from previous step."
+            # Fallback to reconstructing (less reliable)
+            PKB_RUN_URI="r$(echo ${{ github.run_id }}${{ github.run_attempt }} | sed 's/[^a-zA-Z0-9]//g' | tail -c 10)"
+            echo "Using reconstructed fallback RUN URI: $PKB_RUN_URI"
+          fi
+
+          # Define expected paths
+          PKB_RUN_DIR="/tmp/perfkitbenchmarker/runs/${PKB_RUN_URI}"
+          INTERNAL_RESULTS_FILE="${PKB_RUN_DIR}/perfkitbenchmarker_results.json"
+          RESULTS_DEST_PATH="${{ github.workspace }}/pkb_results.json" # Target path for artifact upload
+
+          echo "Searching for results in PKB run directory: ${PKB_RUN_DIR}"
+          echo "Looking for internal results file: ${INTERNAL_RESULTS_FILE}"
+
+          # Check if the internal results file exists and has content
+          if [ -f "${INTERNAL_RESULTS_FILE}" ] && [ -s "${INTERNAL_RESULTS_FILE}" ]; then
+             echo "Found non-empty results file in PKB run directory."
+             echo "Copying ${INTERNAL_RESULTS_FILE} to ${RESULTS_DEST_PATH}..."
+             cp "${INTERNAL_RESULTS_FILE}" "${RESULTS_DEST_PATH}"
+          else
+             # Log detailed error info if file not found
+             echo "------------------------------------------------------------------"
+             echo "Error: Could not find valid PKB JSON results file."
+             echo "Looked for: ${INTERNAL_RESULTS_FILE}"
+             echo "Listing contents of /tmp/perfkitbenchmarker/runs/ :"
+             ls -l /tmp/perfkitbenchmarker/runs/ || echo "  (/tmp/perfkitbenchmarker/runs/ not found or empty)"
+             # If the specific run dir exists, list its contents too
+             if [ -d "${PKB_RUN_DIR}" ]; then
+                 echo "Listing contents of ${PKB_RUN_DIR}:"
+                 ls -l "${PKB_RUN_DIR}" || echo "  (Could not list contents)"
+             fi
+             echo "------------------------------------------------------------------"
+             echo "Creating empty results file to prevent artifact upload failure."
+             echo "{}" > "${RESULTS_DEST_PATH}"
+             # exit 1 # Optionally fail the workflow here
+          fi
+        shell: bash
+
+      - name: Upload PKB Results Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkb-results-${{ env.RUN_ID }} # Use the original full RUN_ID for artifact name
+          path: pkb_results.json # Upload the file copied/created in the previous step
+
+      # --- Steps for Usage-Based Cost Estimation --- 
+      - name: Get Upload File Size
+        id: get_file_size
+        run: |
+          # Ensure sample.jpg is in the workspace root as assumed by PKB copy steps
+          file_path="${{ github.workspace }}/sample.jpg"
+          if [ -f "$file_path" ]; then
+            file_size_bytes=$(stat -c%s "$file_path")
+            echo "sample_jpg_size_bytes=${file_size_bytes}" >> $GITHUB_OUTPUT
+            echo "Found sample.jpg, size: ${file_size_bytes} bytes"
+          else
+            echo "Warning: sample.jpg not found at $file_path. Cannot calculate data transfer usage."
+            echo "sample_jpg_size_bytes=0" >> $GITHUB_OUTPUT # Default to 0 if not found
+          fi
+        shell: bash
+
+      - name: Install PyYAML for Usage File Generation
+        run: pip install pyyaml # Needed for the python script below
+
+      - name: Generate Infracost Usage File
+        id: generate_usage_file
+        run: |
+          chmod +x ${{ github.workspace }}/scripts/generate_infracost_usage.py
+          ${{ github.workspace }}/scripts/generate_infracost_usage.py \
+            ${{ github.workspace }}/pkb_results.json \
+            ${{ github.workspace }}/infracost_usage.yml \
+            ${{ steps.get_file_size.outputs.sample_jpg_size_bytes }}
+        shell: bash
+
+      - name: Re-run Infracost with Usage Data
+        id: infracost_with_usage
+        working-directory: infra # Run infracost from the terraform directory
+        run: |
+          echo "Running Infracost breakdown with usage file..."
+          infracost breakdown --path . \
+            --usage-file ../infracost_usage.yml \
+            --format json \
+            --show-skipped \
+            --terraform-var-file=infracost.tfvars.json \
+            --out-file ../infracost_estimate_with_usage.json # Save to a NEW file
+
+          echo "Saved Infracost estimate with usage to infracost_estimate_with_usage.json"
+
+      # --- Generate Final Summary Report --- 
+      - name: Generate JSON Summary Report
+        id: generate_json_summary
+        run: |
+          # Ensure the script is executable
+          chmod +x ${{ github.workspace }}/scripts/generate_summary_report.py
+          
+          # Run the external script with proper paths (passing the NEW infracost file)
+          ${{ github.workspace }}/scripts/generate_summary_report.py \
+            ${{ github.workspace }}/pkb_results.json \
+            ${{ github.workspace }}/infracost_estimate_with_usage.json \
+            ${{ github.workspace }}/summary_report.json
+        shell: bash
+
+      - name: Upload JSON Summary Report Artifact
+        if: always() # Upload report even if prior steps failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-report-json-${{ env.RUN_ID }}
+          path: summary_report.json # Upload the generated JSON file
+
+      - name: Terraform Destroy (Infra)
+        if: always() # Ensure cleanup runs even if benchmarks fail
+        working-directory: infra
+        run: terraform destroy -auto-approve -var="run_id=${{ env.RUN_ID }}" 
